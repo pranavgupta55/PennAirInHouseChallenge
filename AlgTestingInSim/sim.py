@@ -1,10 +1,10 @@
-# sim_fullscreen_grid.py
+# sim_fullscreen_grid.py (final)
 import numpy as np, cv2, math, time
 
 # ---------------- Config ----------------
-BASE_W, BASE_H = 960, 540       # base camera render for aspect
-GRID_COLS, GRID_ROWS = 3, 3     # full window grid
-MAIN_COLS, MAIN_ROWS = 2, 2     # main view spans 2x2 tiles at (0,0)
+BASE_W, BASE_H = 960, 540       # base camera render aspect [no distortion]
+GRID_COLS, GRID_ROWS = 3, 3     # 3x3 fullscreen grid
+MAIN_COLS, MAIN_ROWS = 2, 2     # main spans 2x2 tiles (0,0)
 
 # ---------------- Camera / geometry ----------------
 RING_DIAM_M = 0.9144
@@ -15,14 +15,14 @@ def K_from_hfov(hfov_deg, w=BASE_W, h=BASE_H):
     fx = (w/2) / math.tan(hfov/2)
     fy = fx
     cx, cy = w/2, h/2
-    return np.array([[fx,0,cx],[0,fy,cy],[0,0,1]], np.float64), fx, fy, cx, cy
+    return np.array([[fx,0,cx],[0,fy,cy],[0,0,1]], np.float64), fx, fy, cx, cy  # pinhole intrinsics [web:33]
 
 def R_from_euler_xyz(rx, ry, rz):
     rx, ry, rz = map(math.radians, (rx, ry, rz))
     Rx = np.array([[1,0,0],[0,math.cos(rx),-math.sin(rx)],[0,math.sin(rx),math.cos(rx)]])
     Ry = np.array([[math.cos(ry),0,math.sin(ry)],[0,1,0],[-math.sin(ry),0,math.cos(ry)]])
     Rz = np.array([[math.cos(rz),-math.sin(rz),0],[math.sin(rz),math.cos(rz),0],[0,0,1]])
-    return Rz @ Ry @ Rx
+    return Rz @ Ry @ Rx  # compose ZYX
 
 def rvec_from_R(R):
     rvec, _ = cv2.Rodrigues(R)
@@ -42,7 +42,7 @@ def add_noise_blur(img, noise_std=0, blur_k=0):
     return out
 
 # ---------------- World grid cube ----------------
-def cube_grid_segments(size=10.0, step=0.5):
+def cube_grid_segments(size=8.0, step=1.0):
     s = size
     z0, z1 = 0.1, s
     segs = []
@@ -62,10 +62,10 @@ def cube_grid_segments(size=10.0, step=0.5):
     return np.array(segs, dtype=np.float64)
 
 def world_to_cam(Pw, R_cam, t_cam):
-    Pw = np.asarray(Pw, dtype=np.float64)
-    return (Pw - t_cam) @ R_cam   # R_cam = (R_c)^T in standard OpenCV notation [web:33][web:117]
+    # OpenCV extrinsics: X_c = R_c^T * (X_w - t_cam)
+    return (np.asarray(Pw, np.float64) - t_cam) @ R_cam  # transform to camera frame [web:117]
 
-def draw_cube_world(img, K, R_cam, t_cam, segs_world, color=(180,180,180)):
+def draw_cube_world(img, K, R_cam, t_cam, segs_world, color=(230,230,230)):
     fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
     for a_w, b_w in segs_world:
         a_c = world_to_cam(a_w, R_cam, t_cam); b_c = world_to_cam(b_w, R_cam, t_cam)
@@ -78,22 +78,22 @@ def draw_cube_world(img, K, R_cam, t_cam, segs_world, color=(180,180,180)):
 def detect_ellipses_fast(frame_bgr):
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     S = hsv[:,:,1]
-    _, mask = cv2.threshold(S, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)     # [web:103]
+    _, mask = cv2.threshold(S, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)     # Otsu on S [web:103]
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    mask2 = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)            # [web:104]
-    band = cv2.morphologyEx(mask2, cv2.MORPH_GRADIENT, k)                       # [web:104]
+    mask2 = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)            # close gaps [web:104]
+    band = cv2.morphologyEx(mask2, cv2.MORPH_GRADIENT, k)                       # thin rim band [web:104]
     contours, _ = cv2.findContours(band, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     ellipses = []
     cand = frame_bgr.copy()
     for c in contours:
-        if len(c) < 40:
+        if len(c) < 40: 
             continue
-        try: e = cv2.fitEllipseAMS(c)                                           # [web:16]
+        try: e = cv2.fitEllipseAMS(c)                                           # robust fit [web:16]
         except Exception:
             try: e = cv2.fitEllipse(c)
             except Exception: continue
         (cx,cy),(MA,ma),ang = e
-        if min(MA,ma) < 12:
+        if min(MA,ma) < 12: 
             continue
         ellipses.append(e)
         cv2.ellipse(cand, e, (0,200,255), 2, cv2.LINE_AA)
@@ -127,61 +127,91 @@ def normal_from_ellipse(e, fx, fy):
     return n
 
 # ---------------- Panels ----------------
-def label_panel(im, text, w=280):
+def label_panel(im, text, w=240):
     out = im.copy()
-    cv2.rectangle(out, (6,6), (6+w, 6+26), (0,0,0), -1)
-    cv2.putText(out, text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv2.LINE_AA)
+    cv2.rectangle(out, (6,6), (6+w, 6+22), (0,0,0), -1)
+    cv2.putText(out, text, (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2, cv2.LINE_AA)
     return out
 
-# 1) Replace render_data_panel with this richer version
 def render_data_panel(K, hfov, n_rings, n_detect, fps, cam_t, cam_rpy,
                       noise_std, blur_k, step_m, var_deg,
                       tx_rate, ty_rate, tz_rate, ang_rate,
                       tile_w, tile_h):
     p = np.full((tile_h, tile_w, 3), 20, np.uint8)
-    x0,y0 = 12, 18
+    x0,y0 = 10, 16
     font = cv2.FONT_HERSHEY_SIMPLEX
-    fs = 0.55; th = 1; lh = 20
+    fs = 0.50; th = 1; lh = 18
     def put(line, dy=lh):
         nonlocal y0
         cv2.putText(p, line, (x0, y0), font, fs, (240,240,240), th, cv2.LINE_AA)
         y0 += dy
     put("Data")
-    put(f"FPS: {fps:5.1f}")
-    put(f"Rings: {n_rings}   Detections: {n_detect}")
+    put(f"FPS: {fps:5.1f}   Rings: {n_rings}   Det: {n_detect}")
     put(f"FOV: {hfov:.1f} deg")
     put("K (px):")
     for r in K:
-        put(f"[ {r[0]:7.1f} {r[1]:7.1f} {r[2]:7.1f} ]")
-    put(f"Noise std: {int(noise_std):3d}   Blur k: {int(blur_k):2d}")
-    put(f"Sep (m): {step_m:.2f}   Var_deg: {var_deg:.1f}")
-    put(f"Cam t (m): ({cam_t[0]:.2f}, {cam_t[1]:.2f}, {cam_t[2]:.2f})")
+        put(f"[ {r[0]:6.1f} {r[1]:6.1f} {r[2]:6.1f} ]")
+    put(f"Noise: {int(noise_std):3d}   Blur: {int(blur_k):2d}")
+    put(f"Sep: {step_m:.2f} m   Var: {var_deg:.1f} deg")
+    put(f"t (m): ({cam_t[0]:.2f},{cam_t[1]:.2f},{cam_t[2]:.2f})")
     rx,ry,rz = cam_rpy
-    put(f"Cam rpy (deg): ({rx:.1f}, {ry:.1f}, {rz:.1f})")
+    put(f"rpy (deg): ({rx:.1f},{ry:.1f},{rz:.1f})")
     put("Speeds:")
-    put(f" TX/TY/TZ (m/s): {tx_rate:.2f}/{ty_rate:.2f}/{tz_rate:.2f}")
-    put(f" ANG (deg/s): {ang_rate:.1f}")
+    put(f" TX/TY/TZ {tx_rate:.2f}/{ty_rate:.2f}/{tz_rate:.2f} m/s")
+    put(f" ANG {ang_rate:.1f} deg/s")
     return p
+
+def render_keybinds_panel(canvas, tile_w, tile_h):
+    # compact 2-column grid overlay inside main view
+    panel_w = min(tile_w*1.8 - 24, 700)
+    panel_h = 22*5 + 16
+    ov = canvas.copy()
+    cv2.rectangle(ov, (12,12), (12+panel_w, 12+panel_h), (0,0,0), -1)
+    canvas[:] = cv2.addWeighted(ov, 0.55, canvas, 0.45, 0)
+    col1 = 20; col2 = panel_w//2 + 24
+    y = 12+22
+    items1 = [
+        "Move: A/D left-right",
+        "Move: W/S up-down",
+        "Move: Q/E back/forward",
+        "Rings: 1/2 -/+",
+        "Sep: ,/. -/+",
+    ]
+    items2 = [
+        "Pitch: I/K",
+        "Yaw:   J/L",
+        "Roll:  U/O",
+        "Noise: N/M -/+",
+        "Blur:  B/V -/+  P: occluder  H: help  Esc: quit",
+    ]
+    for s in items1:
+        cv2.putText(canvas, s, (12+col1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv2.LINE_AA); y += 22
+    y = 12+22
+    for s in items2:
+        cv2.putText(canvas, s, (12+col2, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv2.LINE_AA); y += 22
+    return canvas
 
 # ---------------- Main ----------------
 cv2.namedWindow('Sim', cv2.WINDOW_NORMAL)
-cv2.setWindowProperty('Sim', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+cv2.setWindowProperty('Sim', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)  # fullscreen canvas [web:113]
 
-# Camera pose (camera moves; world fixed)
-cam_t = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-cam_rx, cam_ry, cam_rz = 0.0, 0.0, 0.0
+# Camera pose (dark-mode default, front-right view, slight tilt)
+cam_t = np.array([4.93, -3.20, -2.03], dtype=np.float64)   # x right, y down, z forward
+cam_rx, cam_ry, cam_rz = -16.3, -45.6, -2.1               # deg (I/K pitch, J/L yaw, U/O roll)
 hfov = 78.0
 
 # Rings
-n_rings = 3           # default three rings
-step_m  = 0.9         # increased separation
+n_rings = 4
+step_m  = 0.9
 var_deg = 12.0
 
-# Effects
-noise_std = 0; blur_k = 0; occ_on = 0
+# Effects (start with a touch of noise and blur)
+noise_std = 7
+blur_k = 3
+occ_on = 0
 help_on = True
 
-# Rates (per second)
+# Movement rates
 TX_RATE = 1.5; TY_RATE = 1.5; TZ_RATE = 1.6
 ANG_RATE = 120.0
 NOISE_RATE = 120; BLUR_RATE = 24
@@ -209,6 +239,9 @@ def obj_to_cam(R_w, t_w, R_cam, t_cam):
 ARROW_LEFT  = {81, 65361}; ARROW_RIGHT = {83, 65363}
 ARROW_UP    = {82, 65362}; ARROW_DOWN  = {84, 65364}
 
+# A small fallback canvas to show while window rects are invalid
+_fallback_canvas = np.zeros((BASE_H, BASE_W, 3), np.uint8)
+
 while True:
     tnow = time.perf_counter(); dt = max(1e-3, tnow - tprev); tprev = tnow
     fps = (1.0/dt) if fps == 0 else (1-fps_alpha)*fps + fps_alpha*(1.0/dt)
@@ -216,7 +249,7 @@ while True:
     k = cv2.waitKey(1) & 0xFFFF
     if k == 27: break
 
-    # Translate (A/D/W/S/Q/E)
+    # Translate (A/D/W/S/Q/E) in camera axes
     R_cam = R_from_euler_xyz(cam_rx, cam_ry, cam_rz)
     d = np.zeros(3, dtype=np.float64)
     if k == ord('a') or k in ARROW_LEFT:   d[0] -= TX_RATE*dt
@@ -225,9 +258,9 @@ while True:
     if k == ord('s') or k in ARROW_DOWN:   d[1] += TY_RATE*dt
     if k == ord('q'):                      d[2] += TZ_RATE*dt
     if k == ord('e'):                      d[2] -= TZ_RATE*dt
-    cam_t += R_cam @ d                                                          # [web:33]
+    cam_t += R_cam @ d  # move in camera frame [web:33]
 
-    # Rotate (keep your keybinds)
+    # Rotate (I/K pitch, J/L yaw, U/O roll)
     if k == ord('j'): cam_ry -= ANG_RATE*dt
     if k == ord('l'): cam_ry += ANG_RATE*dt
     if k == ord('u'): cam_rz -= ANG_RATE*dt
@@ -235,12 +268,12 @@ while True:
     if k == ord('k'): cam_rx -= ANG_RATE*dt
     if k == ord('i'): cam_rx += ANG_RATE*dt
 
-    # Rings count and effects (simplified)
+    # Rings and effects
     if k == ord('1'): n_rings = max(1, n_rings-1)
     if k == ord('2'): n_rings = min(30, n_rings+1)
     if k == ord(','): step_m  = max(0.3, step_m - 0.4*dt)
     if k == ord('.'): step_m  = min(2.0, step_m + 0.4*dt)
-    if k == ord('p'): occ_on = 1 - occ_on                     # occluder on 'P'
+    if k == ord('p'): occ_on = 1 - occ_on
     if k == ord('m'): noise_std = min(255, noise_std + int(NOISE_RATE*dt))
     if k == ord('n'): noise_std = max(0,   noise_std - int(NOISE_RATE*dt))
     if k == ord('v'): blur_k = min(31, blur_k + int(BLUR_RATE*dt) | 1)
@@ -251,24 +284,24 @@ while True:
     K, fx, fy, cx, cy = K_from_hfov(hfov)
     R_cam = R_from_euler_xyz(cam_rx, cam_ry, cam_rz)
 
-    # Render base camera frame
-    main = np.full((BASE_H, BASE_W, 3), 235, np.uint8)
-    draw_cube_world(main, K, R_cam, cam_t, cube_segs, color=(180,180,180))
+    # Main camera render (dark mode background)
+    main = np.full((BASE_H, BASE_W, 3), 28, np.uint8)          # dark gray background
+    draw_cube_world(main, K, R_cam, cam_t, cube_segs, color=(230,230,230))  # white grid
     for i in range(n_rings):
         Rw, tw = ring_world_pose(i)
         rvec, tvec = obj_to_cam(Rw, tw, R_cam, cam_t)
-        pts2d, _ = cv2.projectPoints(ring_poly, rvec, tvec, K, None)             # [web:123]
+        pts2d, _ = cv2.projectPoints(ring_poly, rvec, tvec, K, None)           # projection [web:117]
         pts = np.round(pts2d).astype(np.int32).reshape(-1,1,2)
         col = (0, int(50 + 205*(i/max(1,n_rings-1))), 255)
         cv2.polylines(main, [pts], True, col, thickness=10, lineType=cv2.LINE_AA)
     if occ_on:
         x = int(0.45*BASE_W); y = int(0.60*BASE_H); w = int(0.18*BASE_W); h = int(0.10*BASE_H)
         cv2.rectangle(main, (x,y), (x+w, y+h), (200,50,200), thickness=-1)
+
     main_noisy = add_noise_blur(main, noise_std=noise_std, blur_k=blur_k if blur_k%2==1 else max(1, blur_k-1))
 
     # Vision
     ellipses, S, mask, band, cand_overlay, final_overlay = detect_ellipses_fast(main_noisy)
-    n_detect = len(ellipses)
     for e in ellipses:
         xyz = center_xyz_from_ellipse(e, fx, fy, cx, cy, RING_RAD_M)
         if xyz is None: continue
@@ -282,32 +315,49 @@ while True:
         u1 = int(round(fx*p1[0]/p1[2] + cx)); v1 = int(round(fy*p1[1]/p1[2] + cy))
         cv2.arrowedLine(final_overlay, (u0,v0), (u1,v1), (0,255,255), 2, tipLength=0.15, line_type=cv2.LINE_AA)
 
-    # ---------------- Grid assembly (aspect driven sizing) ----------------
-    # Compute tile size from vertical budget to minimize top gap without distortion
-    try:
-        screen = cv2.getWindowImageRect('Sim')  # (x,y,w,h) on some backends
-        if screen is None or (len(screen) < 4) or (screen[2] == 0 or screen[3] == 0):
-            raise Exception("invalid screen rect")
-        scr_w = int(screen[2])
-        scr_h = int(screen[3])
-    except Exception:
-        # fallback: assume reasonable canvases based on BASE sizes
-        scr_w = BASE_W * 3 // 2
-        scr_h = BASE_H * 3 // 2
+    n_detect = len(ellipses)
 
-    # Prefer filling height: choose tile_h from screen height, derive tile_w from camera aspect
+    # ---------------- Grid assembly (maximize height, preserve aspect) ----------------
+    try:
+        rect = cv2.getWindowImageRect('Sim')  # (x,y,w,h) [web:113]
+        scr_w = int(rect[2]) if rect and len(rect) >= 4 and rect[2] > 0 else BASE_W*3//2
+        scr_h = int(rect[3]) if rect and len(rect) >= 4 and rect[3] > 0 else BASE_H*3//2
+    except Exception:
+        scr_w, scr_h = BASE_W*3//2, BASE_H*3//2
+
     cam_aspect = float(BASE_W) / float(BASE_H)
-    tile_h = max(1, scr_h // GRID_ROWS)
-    tile_w_from_aspect = max(1, int(tile_h * cam_aspect))  # preserves camera aspect in each tile row
-    # Ensure 3 tiles fit horizontally; if not, reduce tile_w to fit width safely
-    tile_w = min(tile_w_from_aspect, max(1, scr_w // GRID_COLS))
+
+    # Compute the largest valid tile size that fits width and height, clamp to >= 1
+    tile_h_max_by_h = max(1, scr_h // GRID_ROWS)
+    tile_w_if_max_h = max(1, int(tile_h_max_by_h * cam_aspect))
+    if tile_w_if_max_h * GRID_COLS <= scr_w:
+        tile_h = tile_h_max_by_h
+        tile_w = tile_w_if_max_h
+    else:
+        tile_w = max(1, scr_w // GRID_COLS)
+        tile_h = max(1, int(tile_w / cam_aspect))
+
+    # Final safety clamps
+    tile_w = max(1, tile_w)
+    tile_h = max(1, tile_h)
+
+    # If the sizes are still extremely small due to window race (0..7), show a safe fallback canvas once
+    if tile_w < 8 or tile_h < 8:
+        cv2.imshow('Sim', _fallback_canvas)
+        # skip heavy resize/drawing this frame to avoid OpenCV assert and allow windowing to settle
+        continue
+
     canvas_w = tile_w * GRID_COLS
     canvas_h = tile_h * GRID_ROWS
     canvas = np.zeros((canvas_h, canvas_w, 3), np.uint8)
 
-    # Place main (2x2 tiles)
-    main_rs = cv2.resize(main_noisy, (tile_w*2, tile_h*2), interpolation=cv2.INTER_AREA)
+    # Place main (2x2)
+    main_rs = cv2.resize(main_noisy, (tile_w*2, tile_h*2), interpolation=cv2.INTER_AREA)  # preserve aspect [web:113]
     canvas[0:tile_h*2, 0:tile_w*2] = main_rs
+
+    # Small, grid-style keybinds overlay (only once)
+    if help_on:
+        canvas[0:tile_h*2, 0:tile_w*2] = render_keybinds_panel(canvas[0:tile_h*2, 0:tile_w*2], tile_w, tile_h)
 
     # Panels
     S8 = (S * (255.0/max(1.0, S.max()))).astype(np.uint8)
@@ -320,42 +370,20 @@ while True:
         label_panel(cv2.resize(final_overlay, (tile_w, tile_h), interpolation=cv2.INTER_AREA), "Final overlay"),
     ]
 
-    # Data panel (with live parameters)
     data_panel = render_data_panel(K, hfov, n_rings, n_detect, fps, cam_t, (cam_rx,cam_ry,cam_rz),
                                    noise_std, blur_k, step_m, var_deg,
                                    TX_RATE, TY_RATE, TZ_RATE, ANG_RATE,
                                    tile_w, tile_h)
 
-    # Slot mapping: bottom row left->right, then right column top->bottom
+    # Slots: bottom row then right column
     slots = [(2,0), (2,1), (2,2), (0,2), (1,2)]
     for im,(r,c) in zip(panels, slots):
         y0, x0 = r*tile_h, c*tile_w
         canvas[y0:y0+tile_h, x0:x0+tile_w] = im
 
-    # Top-right data panel
+    # Data panel in top-right
     y0, x0 = 0, 2*tile_w
-    # ensure we don't exceed canvas bounds (defensive)
-    if x0 + tile_w <= canvas_w and y0 + tile_h <= canvas_h:
-        canvas[y0:y0+tile_h, x0:x0+tile_w] = data_panel
-    else:
-        # fall back: place in last slot available
-        canvas[canvas_h - tile_h:canvas_h, canvas_w - tile_w:canvas_w] = data_panel
-
-    # Draw a single help banner once (top-left of the main)
-    if help_on:
-        banner = [
-            "Translate: A/D left-right, W/S up-down, Q/E back-forward",
-            "Rotate: I/K pitch, J/L yaw, U/O roll",
-            "1/2 rings -/+, ,/. sep -/+, N/M noise -/+, B/V blur -/+, P occluder, H toggle, Esc quit",
-        ]
-        ov = canvas.copy()
-        bw = min(int(tile_w*2)-20, 1400)
-        if bw < 10: bw = int(tile_w*2) - 20
-        cv2.rectangle(ov, (10,10), (10+bw, 10+26*len(banner)+12), (0,0,0), -1)
-        canvas = cv2.addWeighted(ov, 0.55, canvas, 0.45, 0)
-        y = 10+22
-        for s in banner:
-            cv2.putText(canvas, s, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA); y += 26
+    canvas[y0:y0+tile_h, x0:x0+tile_w] = data_panel
 
     cv2.imshow('Sim', canvas)
 
