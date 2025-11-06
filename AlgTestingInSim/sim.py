@@ -1,4 +1,4 @@
-# sim_fullscreen_grid.py (unified motion-parallax clustering + fixed graphs + ellipse overlays)
+# sim_fullscreen_grid.py (with motion-parallax control sequence + visualization outputs)
 import numpy as np, cv2, math, time, os, glob
 import matplotlib
 matplotlib.use('Agg')
@@ -18,7 +18,7 @@ def K_from_hfov(hfov_deg, w=BASE_W, h=BASE_H):
     fx = (w/2) / math.tan(hfov/2)
     fy = fx
     cx, cy = w/2, h/2
-    return np.array([[fx,0,cx],[0,fy,cy],[0,0,1]], np.float64), fx, fy, cx, cy  # [web:33]
+    return np.array([[fx,0,cx],[0,fy,cy],[0,0,1]], np.float64), fx, fy, cx, cy
 
 def R_from_euler_xyz(rx, ry, rz):
     rx, ry, rz = map(math.radians, (rx, ry, rz))
@@ -65,7 +65,7 @@ def cube_grid_segments(size=8.0, step=1.0):
     return np.array(segs, dtype=np.float64)
 
 def world_to_cam(Pw, R_cam, t_cam):
-    return (np.asarray(Pw, np.float64) - t_cam) @ R_cam  # X_c = R^T (X_w - t_c) [web:117]
+    return (np.asarray(Pw, np.float64) - t_cam) @ R_cam  # X_c = R^T (X_w - t_c)
 
 def draw_cube_world(img, K, R_cam, t_cam, segs_world, color=(230,230,230)):
     fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
@@ -80,17 +80,17 @@ def draw_cube_world(img, K, R_cam, t_cam, segs_world, color=(230,230,230)):
 def detect_ellipses_fast(frame_bgr):
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     S = hsv[:,:,1]
-    _, mask = cv2.threshold(S, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)     # [web:104]
+    _, mask = cv2.threshold(S, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)     # Otsu on S [web:104]
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    mask2 = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)            # [web:104]
-    band = cv2.morphologyEx(mask2, cv2.MORPH_GRADIENT, k)                       # [web:104]
+    mask2 = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)            # close gaps [web:104]
+    band = cv2.morphologyEx(mask2, cv2.MORPH_GRADIENT, k)                       # thin rim band [web:104]
     contours, _ = cv2.findContours(band, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     ellipses = []
     cand = frame_bgr.copy()
     for c in contours:
         if len(c) < 40: 
             continue
-        try: e = cv2.fitEllipseAMS(c)                                           # [web:16]
+        try: e = cv2.fitEllipseAMS(c)                                           # robust fit [web:16]
         except Exception:
             try: e = cv2.fitEllipse(c)
             except Exception: continue
@@ -147,26 +147,49 @@ def render_data_panel(K, hfov, n_rings, n_detect, fps, cam_t, cam_rpy,
         nonlocal y0
         cv2.putText(p, line, (x0, y0), font, fs, (240,240,240), th, cv2.LINE_AA)
         y0 += dy
-    put("Data"); put(f"FPS: {fps:5.1f}   Rings: {n_rings}   Det: {n_detect}")
-    put(f"FOV: {hfov:.1f} deg"); put("K (px):")
-    for r in K: put(f"[ {r[0]:6.1f} {r[1]:6.1f} {r[2]:6.1f} ]")
+    put("Data")
+    put(f"FPS: {fps:5.1f}   Rings: {n_rings}   Det: {n_detect}")
+    put(f"FOV: {hfov:.1f} deg")
+    put("K (px):")
+    for r in K:
+        put(f"[ {r[0]:6.1f} {r[1]:6.1f} {r[2]:6.1f} ]")
     put(f"Noise: {int(noise_std):3d}   Blur: {int(blur_k):2d}")
     put(f"Sep: {step_m:.2f} m   Var: {var_deg:.1f} deg")
     put(f"t (m): ({cam_t[0]:.2f},{cam_t[1]:.2f},{cam_t[2]:.2f})")
-    rx,ry,rz = cam_rpy; put(f"rpy (deg): ({rx:.1f},{ry:.1f},{rz:.1f})")
-    put("Speeds:"); put(f" TX/TY/TZ {tx_rate:.2f}/{ty_rate:.2f}/{tz_rate:.2f} m/s"); put(f" ANG {ang_rate:.1f} deg/s")
+    rx,ry,rz = cam_rpy
+    put(f"rpy (deg): ({rx:.1f},{ry:.1f},{rz:.1f})")
+    put("Speeds:")
+    put(f" TX/TY/TZ {tx_rate:.2f}/{ty_rate:.2f}/{tz_rate:.2f} m/s")
+    put(f" ANG {ang_rate:.1f} deg/s")
     return p
 
 def render_keybinds_panel(canvas, tile_w, tile_h):
-    panel_w = min(tile_w*1.8 - 24, 700); panel_h = 22*5 + 16
-    ov = canvas.copy(); cv2.rectangle(ov, (12,12), (12+panel_w, 12+panel_h), (0,0,0), -1)
+    panel_w = min(tile_w*1.8 - 24, 700)
+    panel_h = 22*5 + 16
+    ov = canvas.copy()
+    cv2.rectangle(ov, (12,12), (12+panel_w, 12+panel_h), (0,0,0), -1)
     canvas[:] = cv2.addWeighted(ov, 0.55, canvas, 0.45, 0)
-    col1 = 20; col2 = panel_w//2 + 24; y = 12+22
-    items1 = ["Move: A/D left-right","Move: W/S up-down","Move: Q/E back/forward","Rings: 1/2 -/+","Sep: ,/. -/+"]
-    items2 = ["Pitch: I/K","Yaw:   J/L","Roll:  U/O","Noise: N/M -/+","Blur:  B/V -/+  P: occluder  T: sequence  H: help  Esc: quit"]
-    for s in items1: cv2.putText(canvas, s, (12+col1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv2.LINE_AA); y += 22
+    col1 = 20; col2 = panel_w//2 + 24
     y = 12+22
-    for s in items2: cv2.putText(canvas, s, (12+col2, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv2.LINE_AA); y += 22
+    items1 = [
+        "Move: A/D left-right",
+        "Move: W/S up-down",
+        "Move: Q/E back/forward",
+        "Rings: 1/2 -/+",
+        "Sep: ,/. -/+",
+    ]
+    items2 = [
+        "Pitch: I/K",
+        "Yaw:   J/L",
+        "Roll:  U/O",
+        "Noise: N/M -/+",
+        "Blur:  B/V -/+  P: occluder  H: help  Esc: quit",
+    ]
+    for s in items1:
+        cv2.putText(canvas, s, (12+col1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv2.LINE_AA); y += 22
+    y = 12+22
+    for s in items2:
+        cv2.putText(canvas, s, (12+col2, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv2.LINE_AA); y += 22
     return canvas
 
 # ---------------- Sampling & Tracking helpers ----------------
@@ -175,32 +198,90 @@ def sample_contour_points(contour, n_pts=120):
     if len(contour) < 3: return np.zeros((0,2), np.float32)
     diffs = np.diff(contour, axis=0, prepend=contour[-1:])
     lengths = np.linalg.norm(diffs, axis=1)
-    arc = np.cumsum(lengths); total = arc[-1] if arc.size>0 else 0.0
-    if total < 1e-6: return contour[:n_pts] if len(contour)>=n_pts else contour
+    arc = np.cumsum(lengths)
+    total = arc[-1] if arc.size > 0 else 0.0
+    if total < 1e-6:
+        return contour[:n_pts] if len(contour) >= n_pts else contour
     sample_arcs = np.linspace(0, total, n_pts, endpoint=False)
-    idxs = np.searchsorted(arc, sample_arcs); idxs = np.clip(idxs, 0, len(contour)-1)
+    idxs = np.searchsorted(arc, sample_arcs)
+    idxs = np.clip(idxs, 0, len(contour)-1)
     return contour[idxs]
 
 def detect_mask_and_sample_points(bgr, pts_per_contour=120):
-    _, S, mask, band, _, _ = detect_ellipses_fast(bgr)
+    _, S, mask, band, _, _ = detect_ellipses_fast(bgr)  # reuse pipeline stages
     contours, _ = cv2.findContours(band, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    pts_all = []; contour_ids = []
+    pts_all = []
+    contour_ids = []
     for cid, c in enumerate(contours):
         if len(c) < 20: continue
         pts = sample_contour_points(c, n_pts=pts_per_contour)
         if pts.shape[0] == 0: continue
-        pts_all.append(pts); contour_ids.extend([cid]*len(pts))
-    if len(pts_all) == 0: return mask, band, np.zeros((0,2), np.float32), np.zeros((0,), np.int32)
+        pts_all.append(pts)
+        contour_ids.extend([cid]*len(pts))
+    if len(pts_all) == 0:
+        return mask, band, np.zeros((0,2), np.float32), np.zeros((0,), np.int32)
     P = np.vstack(pts_all).astype(np.float32)
     return mask, band, P, np.array(contour_ids, np.int32)
 
 def nn_track(prev_pts, curr_pts, max_dist=15.0):
     if len(prev_pts)==0 or len(curr_pts)==0:
         return np.full((len(prev_pts),), -1, np.int32), np.full((len(prev_pts),), np.inf, np.float32)
+    # full distance matrix
     D = np.linalg.norm(prev_pts[:,None,:] - curr_pts[None,:,:], axis=2)
-    idxs = D.argmin(axis=1); dmin = D[np.arange(len(prev_pts)), idxs]
+    idxs = D.argmin(axis=1)
+    dmin = D[np.arange(len(prev_pts)), idxs]
     idxs[dmin > max_dist] = -1
     return idxs, dmin
+
+def kmeans_1d(values, k, iters=20):
+    v = values.reshape(-1,1).astype(np.float32)
+    if len(v) == 0 or k <= 1:
+        return np.zeros(len(values), np.int32), np.array([v.mean() if len(v)>0 else 0.0])
+    # init with percentiles
+    qs = np.linspace(0, 100, k, endpoint=False) + 50.0/k
+    centers = np.percentile(v, qs).reshape(-1,1).astype(np.float32)
+    for _ in range(iters):
+        d = np.abs(v - centers.T)  # N x k
+        labels = d.argmin(axis=1)
+        new_centers = []
+        for i in range(k):
+            sel = v[labels==i]
+            if len(sel)==0: new_centers.append(centers[i])
+            else: new_centers.append(sel.mean())
+        new_centers = np.array(new_centers, np.float32).reshape(-1,1)
+        if np.allclose(new_centers, centers): break
+        centers = new_centers
+    d = np.abs(v - centers.T)
+    labels = d.argmin(axis=1)
+    return labels, centers.flatten()
+
+def spatial_clusters_from_points(points_xy, img_shape, radius=4, min_area=80):
+    H, W = img_shape
+    mask = np.zeros((H, W), np.uint8)
+    for p in points_xy.astype(np.int32):
+        cv2.circle(mask, tuple(p), radius, 255, -1)
+    # close to merge nearby samples
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+    num, labs = cv2.connectedComponents(mask)
+    labels = []
+    cc_areas = []
+    for i in range(1, num):
+        area = int((labs==i).sum())
+        cc_areas.append(area)
+    # map each point to its CC label
+    out = []
+    for p in points_xy.astype(np.int32):
+        x,y = int(p[0]), int(p[1])
+        if 0 <= y < H and 0 <= x < W:
+            out.append(labs[y,x])
+        else:
+            out.append(0)
+    out = np.array(out, np.int32)
+    # filter tiny CC as noise (set label 0)
+    valid = set([i+1 for i,a in enumerate(cc_areas) if a >= min_area])
+    out = np.array([l if l in valid else 0 for l in out], np.int32)
+    return out
 
 def next_run_dir(base="algorithmOutputVisualizations"):
     os.makedirs(base, exist_ok=True)
@@ -208,14 +289,19 @@ def next_run_dir(base="algorithmOutputVisualizations"):
     idx = 1
     if existing:
         last = existing[-1]
-        try: idx = int(os.path.basename(last).split("_")[-1]) + 1
-        except: idx = len(existing) + 1
-    run_dir = os.path.join(base, f"run_{idx:03d}"); os.makedirs(run_dir, exist_ok=True)
+        try:
+            idx = int(os.path.basename(last).split("_")[-1]) + 1
+        except:
+            idx = len(existing) + 1
+    run_dir = os.path.join(base, f"run_{idx:03d}")
+    os.makedirs(run_dir, exist_ok=True)
     return run_dir
 
 def write_video(path, frames, fps=30):
-    if not frames: return
-    h, w = frames[0].shape[:2]; fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    if not frames:
+        return
+    h, w = frames[0].shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     vw = cv2.VideoWriter(path, fourcc, fps, (w, h))
     for fr in frames:
         if fr.shape[0] != h or fr.shape[1] != w:
@@ -227,47 +313,63 @@ def generate_circular_control_sequence(center_t, radius=1.2, n_frames=90):
     poses = []
     for i in range(n_frames):
         theta = 2 * np.pi * i / n_frames
-        offset = np.array([0.0, radius*np.sin(theta), radius*np.cos(theta)], np.float64)
+        offset = np.array([0.0, radius * np.sin(theta), radius * np.cos(theta)], dtype=np.float64)
         cam_t_i = center_t + offset
-        target = np.array([0.0, 0.0, 3.5], np.float64)
+        target = np.array([0.0, 0.0, 3.5], dtype=np.float64)
         fwd = target - cam_t_i; fwd /= (np.linalg.norm(fwd) + 1e-9)
         yaw = np.degrees(np.arctan2(fwd[0], fwd[2]))
-        pitch = np.degrees(np.arcsin(-fwd[1])); roll = 0.0
+        pitch = np.degrees(np.arcsin(-fwd[1]))
+        roll = 0.0
         cam_R_i = R_from_euler_xyz(pitch, yaw, roll)
         poses.append((cam_t_i, cam_R_i))
     return poses
 
 # ---------------- Main UI ----------------
 cv2.namedWindow('Sim', cv2.WINDOW_NORMAL)
-cv2.setWindowProperty('Sim', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)  # [web:113]
+cv2.setWindowProperty('Sim', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-cam_t = np.array([4.93, -3.20, -2.03], np.float64)
+# Camera pose (dark-mode start)
+cam_t = np.array([4.93, -3.20, -2.03], dtype=np.float64)
 cam_rx, cam_ry, cam_rz = -16.3, -45.6, -2.1
 hfov = 78.0
 
-n_rings = 4; step_m = 0.9; var_deg = 12.0
-noise_std = 7; blur_k = 3; occ_on = 0; help_on = True
+# Rings and effects
+n_rings = 4
+step_m  = 0.9
+var_deg = 12.0
+noise_std = 7
+blur_k = 3
+occ_on = 0
+help_on = True
 
-TX_RATE = 1.5; TY_RATE = 1.5; TZ_RATE = 1.6; ANG_RATE = 120.0
+# Movement rates
+TX_RATE = 1.5; TY_RATE = 1.5; TZ_RATE = 1.6
+ANG_RATE = 120.0
+NOISE_RATE = 120; BLUR_RATE = 24
+
 ring_poly = ring_points3d(n=128)
 cube_segs = cube_grid_segments(size=8.0, step=1.0)
 
-tprev = time.perf_counter(); fps = 0.0
-ARROW_LEFT  = {81, 65361}; ARROW_RIGHT = {83, 65363}; ARROW_UP = {82, 65362}; ARROW_DOWN = {84, 65364}
+tprev = time.perf_counter(); fps = 0.0; fps_alpha = 0.1
+ARROW_LEFT  = {81, 65361}; ARROW_RIGHT = {83, 65363}
+ARROW_UP    = {82, 65362}; ARROW_DOWN  = {84, 65364}
 _fallback_canvas = np.zeros((BASE_H, BASE_W, 3), np.uint8)
 
-seq_running = False
+seq_running = False  # prevent reentry on 'T'
 
 def ring_world_pose(i):
     base_z = 3.0
     z_i = base_z + i*step_m
-    t_w = np.array([0.0, 0.0, z_i], np.float64)
-    rxi = var_deg * math.sin(0.7*i); ryi = var_deg * math.cos(0.9*i); rzi = var_deg * math.sin(1.3*i)
+    t_w = np.array([0.0, 0.0, z_i], dtype=np.float64)
+    rxi = var_deg * math.sin(0.7*i)
+    ryi = var_deg * math.cos(0.9*i)
+    rzi = var_deg * math.sin(1.3*i)
     R_w = R_from_euler_xyz(rxi, ryi, rzi)
     return R_w, t_w
 
 def obj_to_cam(R_w, t_w, R_cam, t_cam):
-    R_oc = R_cam.T @ R_w; t_oc = R_cam.T @ (t_w - t_cam)
+    R_oc = R_cam.T @ R_w
+    t_oc = R_cam.T @ (t_w - t_cam)
     return rvec_from_R(R_oc), t_oc.reshape(3,1)
 
 def render_main_frame(cam_t_loc, R_cam_loc):
@@ -286,65 +388,19 @@ def render_main_frame(cam_t_loc, R_cam_loc):
         cv2.rectangle(main, (x,y), (x+w, y+h), (200,50,200), thickness=-1)
     return K, fx, fy, cx, cy, main
 
-def track_features(tracks, W, H):
-    feats = []
-    for tr in tracks:
-        valid = ~np.isnan(tr).any(axis=1)
-        pts = tr[valid]
-        if pts.shape[0] < 2:
-            feats.append(np.zeros(6, np.float32)); continue
-        d = np.diff(pts, axis=0)
-        mags = np.linalg.norm(d, axis=1) + 1e-6
-        dirs = d / mags[:,None]
-        m_mean = mags.mean(); m_std = mags.std()
-        u_mean = dirs.mean(axis=0)
-        p_mean = (pts.mean(axis=0) / np.array([W, H], np.float32))
-        feats.append(np.array([m_mean, u_mean[0], u_mean[1], p_mean[0], p_mean[1], m_std], np.float32))
-    feats = np.vstack(feats)
-    mu = feats.mean(0); sig = feats.std(0) + 1e-6
-    feats = (feats - mu) / sig
-    return feats
-
-def kmeans_nd(features, k, iters=25):
-    if features.shape[0] == 0 or k <= 1:
-        return np.zeros((features.shape[0],), np.int32), features.mean(0, keepdims=True)
-    # init by k-means++ style: pick first at random, rest by distance prob.
-    rng = np.random.default_rng(42)
-    N, D = features.shape
-    centers = np.empty((k, D), np.float32)
-    centers[0] = features[rng.integers(0, N)]
-    d2 = np.full((N,), np.inf, np.float32)
-    for c in range(1, k):
-        d = np.linalg.norm(features - centers[c-1], axis=1)**2
-        d2 = np.minimum(d2, d)
-        probs = d2 / (d2.sum() + 1e-9)
-        centers[c] = features[rng.choice(N, p=probs)]
-    for _ in range(iters):
-        # assign
-        dist = np.linalg.norm(features[:,None,:] - centers[None,:,:], axis=2)
-        labels = dist.argmin(axis=1)
-        new_centers = centers.copy()
-        for i in range(k):
-            sel = features[labels==i]
-            if len(sel) > 0:
-                new_centers[i] = sel.mean(axis=0)
-        if np.allclose(new_centers, centers): break
-        centers = new_centers
-    dist = np.linalg.norm(features[:,None,:] - centers[None,:,:], axis=2)
-    labels = dist.argmin(axis=1)
-    return labels, centers
-
 def run_control_sequence():
     global seq_running
-    if seq_running: return
+    if seq_running:
+        return
     seq_running = True
     run_dir = next_run_dir("algorithmOutputVisualizations")
     graph_dir = os.path.join(run_dir, "graphs_frames"); os.makedirs(graph_dir, exist_ok=True)
 
+    # 1) Generate control poses and capture frames + sampled points
     poses = generate_circular_control_sequence(cam_t.copy(), radius=1.2, n_frames=90)
-    frames_bgr = []; frames_pts = []; stage1_frames = []
-
-    # capture frames + sampled points
+    frames_bgr = []
+    frames_pts = []
+    stage1_frames = []  # mask + sampled points video
     for t_idx, (ct, Rc) in enumerate(poses):
         K, fx, fy, cx, cy, main = render_main_frame(ct, Rc)
         main_noisy = add_noise_blur(main, noise_std=noise_std, blur_k=blur_k if blur_k%2==1 else max(1, blur_k-1))
@@ -353,59 +409,71 @@ def run_control_sequence():
         for p in pts.astype(np.int32):
             cv2.circle(vis, tuple(p), 2, (0,255,0), -1)
         cv2.putText(vis, f"Frame {t_idx:03d}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
-        frames_bgr.append(main_noisy); frames_pts.append(pts.copy()); stage1_frames.append(vis)
+        frames_bgr.append(main_noisy)
+        frames_pts.append(pts.copy())
+        stage1_frames.append(vis)
 
+    # 2) Track points across frames (fixed set: from frame 0)
     T = len(frames_pts)
     if T == 0 or len(frames_pts[0]) == 0:
-        seq_running = False; return
-
+        seq_running = False
+        return
     N0 = len(frames_pts[0])
     tracks = [np.full((T,2), np.nan, np.float32) for _ in range(N0)]
     for i in range(N0): tracks[i][0] = frames_pts[0][i]
-
-    # NN tracking with gate
     for t_idx in range(1, T):
-        prev = frames_pts[t_idx-1]; curr = frames_pts[t_idx]
+        prev = frames_pts[t_idx-1]
+        curr = frames_pts[t_idx]
         idxs, dists = nn_track(prev, curr, max_dist=20.0)
         for i, j in enumerate(idxs):
             if 0 <= j < len(curr):
                 tracks[i][t_idx] = curr[j]
 
-    # Per-frame 2D flow magnitudes + per-frame sorted graphs
-    graph_frames = []
+    # 3) Compute instantaneous and mean flow magnitudes
+    inst_mags = []
     for t_idx in range(T):
         mags_t = np.zeros((N0,), np.float32)
         if t_idx > 0:
             prev = np.array([tracks[i][t_idx-1] for i in range(N0)])
-            curr = np.array([tracks[i][t_idx]   for i in range(N0)])
-            valid = ~np.isnan(prev).any(axis=1) & ~np.isnan(curr).any(axis=1)
-            d = curr[valid] - prev[valid]
-            mags_t[valid] = np.linalg.norm(d, axis=1)  # 2D magnitude
-        # sorted plot for this frame only
-        y = mags_t
-        mask_defined = y > 0
-        ys = y[mask_defined]
-        if ys.size == 0:
-            ys = np.array([0.0])
-        order = np.argsort(ys)
-        xs_sorted = np.arange(len(ys))[order]; ys_sorted = ys[order]
-        plt.figure(figsize=(8,4.5), dpi=160)
-        plt.plot(xs_sorted, ys_sorted, 'o', markersize=3)
-        plt.title(f"Depth proxy per point (frame {t_idx})\n(smaller is farther)")
-        plt.xlabel("sorted point index"); plt.ylabel("flow magnitude (px)")
-        plt.grid(True, alpha=0.3)
-        png_path = os.path.join(graph_dir, f"graph_{t_idx:03d}.png")
-        plt.savefig(png_path, bbox_inches='tight'); plt.close()
-        img = cv2.imread(png_path); 
-        if img is None: img = np.zeros((540,960,3), np.uint8)
-        graph_frames.append(img)
+            curr = np.array([tracks[i][t_idx] for i in range(N0)])
+            valid = ~(np.isnan(prev).any(axis=1) | np.isnan(curr).any(axis=1))
+            mags_t[valid] = np.linalg.norm(curr[valid] - prev[valid], axis=1)
+        inst_mags.append(mags_t)
+    mean_mags = np.zeros((N0,), np.float32)
+    counts = np.zeros((N0,), np.int32)
+    for t_idx in range(1, T):
+        m = inst_mags[t_idx]
+        val = ~np.isnan(tracks[0][t_idx-1:t_idx+1]).any()  # dummy access to avoid warnings
+        mean_mags += m
+        counts += (m>0).astype(np.int32)
+    counts[counts==0] = 1
+    mean_mags /= counts
 
-    # Unified feature vector per track (mean mag, mean direction, mean position, mag std)
-    F = track_features(tracks, BASE_W, BASE_H)
-    k = max(1, min(n_rings, max(1, np.unique(~np.isnan(F).any(axis=1)).sum())))
-    labels, centers = kmeans_nd(F, k=n_rings, iters=30)
+    # 4) Depth clustering by 1D k-means (k ~ n_rings)
+    k = max(1, min(n_rings, len(np.unique(mean_mags.round(3)))))
+    depth_labels, centers = kmeans_1d(mean_mags, k=max(1,k))
 
-    # Colored points video (cluster labels)
+    # 5) Spatial clustering within each depth on the final frame positions
+    final_pts = np.array([tracks[i][T-1] for i in range(N0)])
+    spatial_labels = np.zeros((N0,), np.int32)
+    obj_id = 1
+    for d in range(depth_labels.max()+1):
+        sel = np.where(depth_labels==d)[0]
+        pts_d = final_pts[sel]
+        valid = ~np.isnan(pts_d).any(axis=1)
+        sel_valid = sel[valid]
+        pts_valid = pts_d[valid]
+        if len(pts_valid)==0:
+            continue
+        labs = spatial_clusters_from_points(pts_valid, (BASE_H, BASE_W), radius=4, min_area=60)
+        # map CC labels to consecutive object ids
+        uniq = sorted([l for l in np.unique(labs) if l>0])
+        mapping = {l:(obj_id+i) for i,l in enumerate(uniq)}
+        for i, l in enumerate(labs):
+            spatial_labels[sel_valid[i]] = mapping.get(l, 0)
+        obj_id += len(uniq)
+
+    # 6) Colored points video (object assignments)
     colors = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),(255,0,255),(0,255,255),(255,128,0),(0,128,255)]
     stage2_frames = []
     for t_idx in range(T):
@@ -414,38 +482,53 @@ def run_control_sequence():
         for tid in range(N0):
             p = tracks[tid][t_idx]
             if not np.isnan(p).any():
-                col = colors[labels[tid] % len(colors)]
+                oid = spatial_labels[tid]
+                col = (200,200,200) if oid==0 else colors[(oid-1)%len(colors)]
                 cv2.circle(vis, (int(p[0]), int(p[1])), 2, col, -1)
         cv2.putText(vis, f"Frame {t_idx:03d}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         stage2_frames.append(vis)
 
-    # Fit an ellipse per cluster from all its track points; draw ellipses
-    summary = frames_bgr[-1].copy()
-    H, W = summary.shape[:2]
-    final_ellipses = []
-    for c in range(n_rings):
-        tids = np.where(labels==c)[0]
-        pts_all = []
-        for tid in tids:
-            tr = tracks[tid]
-            valid = ~np.isnan(tr).any(axis=1)
-            pts_all.append(tr[valid])
-        if len(pts_all)==0: continue
-        P = np.vstack(pts_all).astype(np.float32)
-        if len(P) < 5: continue
-        cnt = P.reshape(-1,1,2).astype(np.int32)
-        try: e = cv2.fitEllipseAMS(cnt)
-        except: 
-            try: e = cv2.fitEllipse(cnt)
-            except: continue
-        final_ellipses.append(e)
-        cv2.ellipse(summary, e, (0,255,0), 2, cv2.LINE_AA)  # draw ellipse
+    # 7) Per-frame Matplotlib graphs: index vs depth-proxy (flow magnitude), sorted
+    graph_frames = []
+    for t_idx in range(T):
+        y = inst_mags[t_idx]
+        x = np.arange(N0)
+        # keep only defined mags
+        mask_defined = y > 0
+        xs = x[mask_defined]
+        ys = y[mask_defined]
+        if len(ys)==0:
+            ys = np.array([0.0]); xs = np.array([0])
+        order = np.argsort(ys)
+        xs_sorted = np.arange(len(ys))[order]  # reindex after sort
+        ys_sorted = ys[order]
+        plt.figure(figsize=(8,4.5), dpi=160)
+        plt.plot(xs_sorted, ys_sorted, 'o', markersize=3)
+        plt.title(f"Depth proxy per point (frame {t_idx})\n(smaller is farther)")
+        plt.xlabel("sorted point index")
+        plt.ylabel("flow magnitude (px)")
+        plt.grid(True, alpha=0.3)
+        png_path = os.path.join(graph_dir, f"graph_{t_idx:03d}.png")
+        plt.savefig(png_path, bbox_inches='tight')
+        plt.close()
+        img = cv2.imread(png_path)
+        if img is None:
+            img = np.zeros((540,960,3), np.uint8)
+        graph_frames.append(img)
 
-    # Save artifacts
-    run_dir = os.path.dirname(graph_dir)
+    # 8) Write videos and artifacts
     write_video(os.path.join(run_dir, "stage1_sampled_points.mp4"), stage1_frames, fps=30)
     write_video(os.path.join(run_dir, "stage2_color_clusters.mp4"), stage2_frames, fps=30)
     write_video(os.path.join(run_dir, "stage3_depth_graphs.mp4"), graph_frames, fps=30)
+
+    # Optional: save final cluster summary image
+    summary = frames_bgr[-1].copy()
+    for tid in range(N0):
+        p = tracks[tid][-1]
+        if not np.isnan(p).any():
+            oid = spatial_labels[tid]
+            col = (200,200,200) if oid==0 else colors[(oid-1)%len(colors)]
+            cv2.circle(summary, (int(p[0]), int(p[1])), 2, col, -1)
     cv2.imwrite(os.path.join(run_dir, "final_object_assignments.png"), summary)
 
     seq_running = False
@@ -462,7 +545,7 @@ while True:
 
     # Translate
     R_cam = R_from_euler_xyz(cam_rx, cam_ry, cam_rz)
-    d = np.zeros(3, np.float64)
+    d = np.zeros(3, dtype=np.float64)
     if k == ord('a') or k in ARROW_LEFT:   d[0] -= 1.5*dt
     if k == ord('d') or k in ARROW_RIGHT:  d[0] += 1.5*dt
     if k == ord('w') or k in ARROW_UP:     d[1] -= 1.5*dt
@@ -491,7 +574,7 @@ while True:
     if k == ord('b'): blur_k = max(0,  blur_k - int(24*dt))
     if k == ord('h'): help_on = not help_on
 
-    # Grid tile sizing
+    # Compute grid tile sizes from window rect; clamp to avoid race
     try:
         rect = cv2.getWindowImageRect('Sim')
         scr_w = int(rect[2]) if rect and len(rect) >= 4 and rect[2] > 0 else BASE_W*3//2
@@ -512,7 +595,7 @@ while True:
     canvas_w = tile_w * GRID_COLS; canvas_h = tile_h * GRID_ROWS
     canvas = np.zeros((canvas_h, canvas_w, 3), np.uint8)
 
-    # Main render
+    # Render main panel
     K, fx, fy, cx, cy = K_from_hfov(hfov)
     R_cam = R_from_euler_xyz(cam_rx, cam_ry, cam_rz)
     main = np.full((BASE_H, BASE_W, 3), 28, np.uint8)
@@ -529,12 +612,15 @@ while True:
         cv2.rectangle(main, (x,y), (x+w, y+h), (200,50,200), thickness=-1)
     main_noisy = add_noise_blur(main, noise_std=noise_std, blur_k=blur_k if blur_k%2==1 else max(1, blur_k-1))
 
+    # Place main 2x2
     main_rs = cv2.resize(main_noisy, (tile_w*2, tile_h*2), interpolation=cv2.INTER_AREA)
     canvas[0:tile_h*2, 0:tile_w*2] = main_rs
+
+    # Help panel once
     if help_on:
         canvas[0:tile_h*2, 0:tile_w*2] = render_keybinds_panel(canvas[0:tile_h*2, 0:tile_w*2], tile_w, tile_h)
 
-    # Stages + data
+    # Quick stages for the four tiles + data
     ellipses, S, mask, band, cand_overlay, final_overlay = detect_ellipses_fast(main_noisy)
     n_detect = len(ellipses)
     S8 = (S * (255.0/max(1.0, S.max()))).astype(np.uint8)
@@ -546,14 +632,19 @@ while True:
         label_panel(cv2.resize(cand_overlay, (tile_w, tile_h), interpolation=cv2.INTER_AREA), "Ellipse candidates"),
         label_panel(cv2.resize(final_overlay, (tile_w, tile_h), interpolation=cv2.INTER_AREA), "Final overlay"),
     ]
+
     data_panel = render_data_panel(K, hfov, n_rings, n_detect, fps, cam_t, (cam_rx,cam_ry,cam_rz),
                                    noise_std, blur_k, step_m, var_deg,
                                    TX_RATE, TY_RATE, TZ_RATE, ANG_RATE,
                                    tile_w, tile_h)
+
     slots = [(2,0), (2,1), (2,2), (0,2), (1,2)]
     for im,(r,c) in zip(panels, slots):
-        y0, x0 = r*tile_h, c*tile_w; canvas[y0:y0+tile_h, x0:x0+tile_w] = im
-    y0, x0 = 0, 2*tile_w; canvas[y0:y0+tile_h, x0:x0+tile_w] = data_panel
+        y0, x0 = r*tile_h, c*tile_w
+        canvas[y0:y0+tile_h, x0:x0+tile_w] = im
+
+    y0, x0 = 0, 2*tile_w
+    canvas[y0:y0+tile_h, x0:x0+tile_w] = data_panel
 
     cv2.imshow('Sim', canvas)
 
