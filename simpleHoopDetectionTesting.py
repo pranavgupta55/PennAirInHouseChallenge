@@ -6,7 +6,7 @@ import glob
 import json
 from hoopDetectorAlgorithm import (
     find_nearest_hoop_pose, draw_hoop_pose_overlay, get_default_K, 
-    RING_RAD_M_DEFAULT, HoopTrackerState
+    RING_RAD_M_DEFAULT
 )
 
 # --- Directory Management ---
@@ -46,20 +46,18 @@ def process_video_and_save_debug(input_path, output_dir, K, ring_radii_m):
     fps = cap.get(cv2.CAP_PROP_FPS)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     
-    # Initialize tracker
-    tracker_state = HoopTrackerState()
-    
     # Initialize output writer
     final_output_path = os.path.join(output_dir, "00_hoop_pose_overlay.mp4")
     out_final = cv2.VideoWriter(final_output_path, fourcc, fps, (frame_width, frame_height))
     
+    # Writers for the *kept* intermediate debug files
     intermediate_writers = {}
+    intermediate_file_names = ['02_Binary_Mask', '04_Ellipse_Candidates', '06_Sampled_Points']
     
-    # Statistics
+    # Statistics (for console summary only)
     stats = {
         'total_frames': 0,
         'detected_frames': 0,
-        'lost_frames': 0,
         'radius_usage': {r: 0 for r in ring_radii_m},
         'avg_depth': []
     }
@@ -71,57 +69,7 @@ def process_video_and_save_debug(input_path, output_dir, K, ring_radii_m):
     
     frame_count = 0
     
-    # Process first frame to understand what's happening
-    ret, first_frame = cap.read()
-    if ret:
-        print("\n=== FIRST FRAME ANALYSIS ===")
-        result = find_nearest_hoop_pose(first_frame, K, ring_radii_m, tracker_state)
-        
-        if len(result) == 2:
-            _, intermediate_frames = result
-            print(f"No detection in first frame")
-        else:
-            center_3d, normal_3d, ellipse, used_radius, intermediate_frames = result
-            print(f"Detection found! Radius: {used_radius}m, Depth: {center_3d[2]:.2f}m")
-        
-        # Write first frame debug info
-        for name, debug_frame in intermediate_frames.items():
-            debug_path = os.path.join(output_dir, f"{name}.mp4")
-            if debug_frame.ndim == 2:
-                debug_frame = cv2.cvtColor(debug_frame, cv2.COLOR_GRAY2BGR)
-            
-            if debug_frame.shape[:2] != (frame_height, frame_width):
-                debug_frame = cv2.resize(debug_frame, (frame_width, frame_height))
-            
-            writer = cv2.VideoWriter(debug_path, fourcc, fps, (frame_width, frame_height))
-            intermediate_writers[name] = writer
-            writer.write(debug_frame)
-        
-        # Process first frame for main output
-        frame_overlay = first_frame.copy()
-        if len(result) > 2:
-            center_3d, normal_3d, ellipse, used_radius, _ = result
-            draw_hoop_pose_overlay(frame_overlay, K, center_3d, normal_3d, ellipse, used_radius)
-            cv2.putText(frame_overlay, f"Depth: {center_3d[2]:.2f}m", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            stats['detected_frames'] += 1
-            stats['radius_usage'][used_radius] += 1
-            stats['avg_depth'].append(center_3d[2])
-        else:
-            cv2.putText(frame_overlay, "No detection", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            stats['lost_frames'] += 1
-        
-        out_final.write(frame_overlay)
-        stats['total_frames'] += 1
-        frame_count = 1
-        
-        print("======================\n")
-    
-    # Reset cap to start
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 1)
-    
-    # Process remaining frames
+    # Process all frames
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -133,7 +81,7 @@ def process_video_and_save_debug(input_path, output_dir, K, ring_radii_m):
             K = get_default_K(frame_width, frame_height)
         
         # Run algorithm
-        result = find_nearest_hoop_pose(frame, K, ring_radii_m, tracker_state)
+        result = find_nearest_hoop_pose(frame, K, ring_radii_m)
         
         if len(result) == 2:
             result_data, intermediate_frames = result
@@ -142,12 +90,29 @@ def process_video_and_save_debug(input_path, output_dir, K, ring_radii_m):
             center_3d, normal_3d, ellipse, used_radius, intermediate_frames = result
             result_data = (center_3d, normal_3d, ellipse, used_radius)
         
+        # Initialize intermediate writers on the first frame if needed
+        if frame_count == 0:
+            for name in intermediate_file_names:
+                debug_frame = intermediate_frames.get(name)
+                if debug_frame is not None:
+                    debug_path = os.path.join(output_dir, f"{name}.mp4")
+                    
+                    if debug_frame.ndim == 2:
+                        debug_frame = cv2.cvtColor(debug_frame, cv2.COLOR_GRAY2BGR)
+                    if debug_frame.shape[:2] != (frame_height, frame_width):
+                        debug_frame = cv2.resize(debug_frame, (frame_width, frame_height))
+                    
+                    writer = cv2.VideoWriter(debug_path, fourcc, fps, (frame_width, frame_height))
+                    intermediate_writers[name] = writer
+        
         # Write intermediate frames
-        for name, debug_frame in intermediate_frames.items():
+        for name in intermediate_file_names:
             writer = intermediate_writers.get(name)
-            if writer is not None:
+            debug_frame = intermediate_frames.get(name)
+            if writer is not None and debug_frame is not None:
                 if debug_frame.ndim == 2:
                     debug_frame = cv2.cvtColor(debug_frame, cv2.COLOR_GRAY2BGR)
+                # Resize only if necessary, though it should match or be 3-channel already
                 if debug_frame.shape[:2] != (frame_height, frame_width):
                     debug_frame = cv2.resize(debug_frame, (frame_width, frame_height))
                 
@@ -155,17 +120,19 @@ def process_video_and_save_debug(input_path, output_dir, K, ring_radii_m):
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
                 writer.write(debug_frame)
         
-        # Process main output
+        # --- Process Main Output ---
         frame_overlay = frame.copy()
         
         if result_data:
             center_3d, normal_3d, ellipse, used_radius = result_data
+            # draw_hoop_pose_overlay internally uses the normal data
             draw_hoop_pose_overlay(frame_overlay, K, center_3d, normal_3d, ellipse, used_radius)
             
             info_text = [
                 f"Frame: {frame_count}",
                 f"Depth: {center_3d[2]:.2f}m",
-                f"Radius: {used_radius:.3f}m"
+                f"Radius: {used_radius:.3f}m",
+                f"Normal: X:{normal_3d[0]:.2f}, Y:{normal_3d[1]:.2f}, Z:{normal_3d[2]:.2f}"
             ]
             
             for i, text in enumerate(info_text):
@@ -178,9 +145,9 @@ def process_video_and_save_debug(input_path, output_dir, K, ring_radii_m):
         else:
             cv2.putText(frame_overlay, f"Frame {frame_count}: No detection",
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            stats['lost_frames'] += 1
         
         out_final.write(frame_overlay)
+        
         frame_count += 1
         stats['total_frames'] += 1
         
@@ -195,16 +162,11 @@ def process_video_and_save_debug(input_path, output_dir, K, ring_radii_m):
     for writer in intermediate_writers.values():
         writer.release()
     
-    # Calculate statistics
+    # Calculate statistics (for console only)
     if stats['avg_depth']:
         stats['avg_depth'] = sum(stats['avg_depth']) / len(stats['avg_depth'])
     else:
         stats['avg_depth'] = 0
-    
-    # Save statistics
-    stats_path = os.path.join(output_dir, "statistics.json")
-    with open(stats_path, 'w') as f:
-        json.dump(stats, f, indent=2)
     
     # Print summary
     print("\n" + "="*50)
@@ -224,7 +186,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Hoop detection with debugging.")
     parser.add_argument('input_video', type=str, help='Input video path')
     parser.add_argument('--radii', type=float, nargs='+',
-                       default=[0.2, 0.3, 0.4572, 0.6, 0.9],
+                       default=[0.2],
                        help='Ring radii to test (meters)')
     parser.add_argument('--base_output_dir', type=str,
                        default='SimpleAlgTestingOnRealSim',
@@ -232,7 +194,11 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     
-    run_dir = get_next_run_dir(args.base_output_dir)
-    K_matrix = get_default_K()
+    # Convert radii to float keys for dictionary use later
+    radii = [float(r) for r in args.radii]
     
-    process_video_and_save_debug(args.input_video, run_dir, K_matrix, args.radii)
+    run_dir = get_next_run_dir(args.base_output_dir)
+    # The default intrinsic matrix K is calculated here based on the default W, H, and HFOV.
+    K_matrix = get_default_K() 
+    
+    process_video_and_save_debug(args.input_video, run_dir, K_matrix, radii)
