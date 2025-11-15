@@ -8,7 +8,6 @@ This script:
  - seeds LK tracks from frame-0 points and finds stable seed tracks
  - fits initial image-space ellipses to those seed tracks and extends them
    across all frames by searching along the projected ellipse perimeter
- - **GROUPS 2D trajectories based on their initial fitted ellipse parameters.**
  - triangulates 3D positions for each ellipse's tracked points using camera
    poses (parallax) and fits a 3D circle in the best-fit plane
  - reprojects the 3D circle to each image to get a refined, depth-aware ellipse
@@ -64,12 +63,8 @@ ELLIPSE_SAMPLE_RES = 360
 
 MIN_TRAJECTORY_LEN = 8
 
-# DBSCAN settings for final descriptors
 DBSCAN_EPS = 40.0
 DBSCAN_MIN_SAMPLES = 2
-# DBSCAN settings for trajectory grouping (based on initial 2D ellipse centers)
-GROUP_DBSCAN_EPS_PX = 100.0
-GROUP_DBSCAN_MIN_SAMPLES = 5 # Needs enough points to form a solid ring track
 
 RUN_DIR_BASE = "algorithmOutputVisualizations"
 DEBUG_DIR_BASE = "debugInfo"
@@ -318,12 +313,15 @@ def triangulate_trajectory_points(trajectory, poses, K, min_pairs=1):
     poses: list of (cam_t, R_cam)
     K: intrinsics 3x3
     Returns: Nx3 triangulated points in world coordinates (may have NaNs if failed)
+    Strategy: triangulate each pair (t_i, t_j) where both detections exist and baseline > threshold.
+    We'll pick pairs separated by at least T//6 frames for baseline.
     """
     if len(trajectory) < 2:
         return np.zeros((0,3), np.float32)
     T = len(poses)
     
-    MAX_DISTANCE_FROM_ORIGIN = 20.0 # Strict limit for ill-conditioned points
+    # Sanity check limit for triangulated points
+    MAX_DISTANCE_FROM_ORIGIN = 20.0 # meters, generous limit for ill-conditioned points
 
     # Build map t->(x,y)
     t_to_xy = {int(t): np.array([x,y], dtype=np.float64) for (t,x,y) in trajectory}
@@ -334,8 +332,7 @@ def triangulate_trajectory_points(trajectory, poses, K, min_pairs=1):
     for (ct, Rc) in poses:
         P_mats.append(compute_camera_projection(K, Rc, ct))
     # choose pairs: for each time, pair with time separated by at least sep frames
-    # Use a large separation for better baseline: T/4
-    sep = max(1, len(poses) // 4) 
+    sep = max(1, len(poses) // 6)
     for i, t0 in enumerate(times):
         for t1 in times[i+1:]:
             if abs(t1 - t0) < sep:
@@ -372,14 +369,7 @@ def fit_plane_pca(X):
         return None, None, None, None
     mu = X.mean(axis=0)
     Xc = X - mu
-    
-    # Use float32 to match cv2/numpy default in other parts, 
-    # but SVD is generally more robust on float64, keeping it float64 as per numpy default
-    try:
-        U,S,Vt = np.linalg.svd(Xc, full_matrices=False)
-    except Exception:
-        return None, None, None, None
-
+    U,S,Vt = np.linalg.svd(Xc, full_matrices=False)
     # principal directions: Vt[0], Vt[1]; normal = Vt[2]
     e1 = Vt[0,:]
     e2 = Vt[1,:]
@@ -407,12 +397,8 @@ def fit_circle_2d_kasa(pts2d):
     A = np.vstack([2*x, 2*y, np.ones_like(x)]).T  # (N,3)
     b = x**2 + y**2
     try:
-        # lstsq is generally robust
         sol, *_ = np.linalg.lstsq(A, b, rcond=None)
         a, b0, c = sol
-        # Check for non-physical radius (imaginary)
-        if (a*a + b0*b0 + c) < 0:
-             return None, None
         r = math.sqrt(max(0.0, a*a + b0*b0 + c))
         center = np.array([a,b0], dtype=np.float32)
         return center, float(r)
@@ -433,33 +419,9 @@ def build_3d_circle_from_triangulated(X3):
     e1n = e1 / (np.linalg.norm(e1) + 1e-12)
     e2n = e2 / (np.linalg.norm(e2) + 1e-12)
     pts2d = project_points_to_plane_coords(X3, plane_origin, e1n, e2n)
-    
-    # Filter out potential outliers in the projected 2D space before circle fit
-    # This addresses the possibility that a few far-off 3D points survived triangulation sanity checks
-    # and would skew the 2D circle fit.
-    if pts2d.shape[0] > 0:
-        mean_2d = pts2d.mean(axis=0)
-        dist_2d = np.linalg.norm(pts2d - mean_2d, axis=1)
-        # Assuming all points belong to a ring of approx. RING_RAD_M (0.4572m)
-        # Use 2x expected diameter as a generous outlier threshold
-        outlier_threshold = 2.0 * RING_DIAM_M
-        inlier_mask = dist_2d < outlier_threshold
-        pts2d_filtered = pts2d[inlier_mask]
-        
-        if pts2d_filtered.shape[0] < 3:
-            return None
-        pts2d = pts2d_filtered
-        
     center2d, radius2d = fit_circle_2d_kasa(pts2d)
     if center2d is None:
         return None
-    
-    # Sanity check the fitted radius against the known ring radius (RING_RAD_M)
-    # The fitted circle should be close to the actual radius.
-    # Set a generous tolerance, e.g., 5x the actual radius for robustness against projection effects
-    if radius2d > 5.0 * RING_RAD_M or radius2d < 0.1 * RING_RAD_M:
-         return None
-         
     center3d = plane_origin + center2d[0]*e1n + center2d[1]*e2n
     return {
         'center3d': center3d,
@@ -492,32 +454,10 @@ def draw_trajectories_overlay(img, trajectories, colors, draw_points=True, draw_
     for i,tr in enumerate(trajectories):
         col = tuple(int(x) for x in colors[i % len(colors)])
         if draw_points:
-            # Trajectories are now lists of (t, x, y) tuples from all points
-            points_at_t = [(x,y) for (t,x,y) in tr['trajectory'] if t == len(out)] # t is not index, but time index
-            
-            # Need to iterate over the time-mapped trajectory points
-            t_idx = int(tr.get('ref_frame_idx', -1)) # use ref_frame_idx for the single frame overlay if available
-
             for (t,x,y) in tr['trajectory']:
-                if t == t_idx:
-                    px,py = int(round(x)), int(round(y))
-                    if 0 <= px < out.shape[1] and 0 <= py < out.shape[0]:
-                         cv2.circle(out, (px,py), 2, col, -1)
-                
-            # For the single frame overlay, simplify to just drawing points for all frames
-            # This logic is too complex for a single frame, let's fix the call to draw_trajectories_overlay
-            # The previous code only drew points for the frame where the trajectory *ended*.
-            # For debugging single frames, we should draw all points visible in that frame.
-            
-            # Let's fix this for the single frame overlay:
-            # We want to show all points for the current trajectory *at a given frame t_idx*
-            if 'trajectory_map' in tr:
-                if t_idx in tr['trajectory_map']:
-                    for (x,y) in tr['trajectory_map'][t_idx]:
-                        px,py = int(round(x)), int(round(y))
-                        if 0 <= px < out.shape[1] and 0 <= py < out.shape[0]:
-                             cv2.circle(out, (px,py), 2, col, -1)
-                    
+                px,py = int(round(x)), int(round(y))
+                if 0 <= px < out.shape[1] and 0 <= py < out.shape[0]:
+                    cv2.circle(out, (px,py), 2, col, -1)
         if draw_ellipses and 'refined_ellipse' in tr and tr['refined_ellipse'] is not None:
             e = tr['refined_ellipse']
             # e is cv2 ellipse tuple
@@ -526,165 +466,138 @@ def draw_trajectories_overlay(img, trajectories, colors, draw_points=True, draw_
                                float(e[2]) ), color=col, thickness=2, lineType=cv2.LINE_AA)
     return out
 
-def group_trajectories_by_initial_fit(trajectories, W, H):
-    """
-    Groups individual point trajectories into Super-Trajectories representing
-    each physical ring, based on the proximity of their initial fitted 2D ellipses.
-    """
-    if not trajectories:
+def ellipse_propagation_pipeline(frames_bgr, pts_frames, contours_frames, poses, K):
+    T = len(frames_bgr)
+    if len(pts_frames) == 0 or pts_frames[0].shape[0] == 0:
         return []
-        
-    # 1. Collect descriptors and indices
-    initial_descs = []
-    valid_traj_indices = []
-    for i, tr in enumerate(trajectories):
-        e = tr.get('fitted_ellipse')
-        if e is not None:
-            initial_descs.append(ellipse_descriptor_from_params(e))
-            valid_traj_indices.append(i)
-            
-    if not initial_descs:
-        return []
-        
-    descs = np.vstack(initial_descs)
-    
-    # Normalize centers by image size (W,H) for better clustering scale
-    # Normalize descriptors: [cx/W, cy/H, w/W, h/H] - using just centers might be enough
-    centers = descs[:, 0:2]
-    centers_norm = centers.copy()
-    centers_norm[:,0] /= W
-    centers_norm[:,1] /= H
+    init_pts = pts_frames[0].astype(np.float32)
+    seed_tracks = compute_tracks_lk(frames_bgr, init_pts, fb_thresh=LK_FB_THRESH)
+    N0 = len(seed_tracks)
 
-    # 2. Cluster the ellipse centers to group trajectories for the same ring
-    # Use normalized centers for distance calculation, but use DBSCAN_EPS as a scale factor
-    eps_norm = GROUP_DBSCAN_EPS_PX / float((W + H) / 2.0)
-    
-    if SKLEARN_OK:
-        # Use DBSCAN on normalized centers
-        db = DBSCAN(eps=eps_norm, min_samples=GROUP_DBSCAN_MIN_SAMPLES, metric='euclidean')
-        labels = db.fit_predict(centers_norm)
-    else:
-        # Fallback to KMeans (simple clustering for fixed N_RINGS)
-        def kmeans_simple(X, k):
-             # (implementation from main, simplified)
-            rng = np.random.default_rng(42)
-            N = X.shape[0]
-            k = min(k, N)
-            if k == 0: return np.zeros(N, dtype=np.int64) - 1 # No clusters
-            centers = X[rng.choice(N, size=k, replace=False)]
-            for _ in range(50):
-                d = np.linalg.norm(X[:,None,:] - centers[None,:,:], axis=2)
-                labs = d.argmin(axis=1)
-                newc = np.array([X[labs==i].mean(axis=0) if np.any(labs==i) else centers[i] for i in range(k)])
-                if np.allclose(newc, centers): break
-                centers = newc
-            return d.argmin(axis=1)
-            
-        k = max(1, N_RINGS)
-        labels = kmeans_simple(centers_norm, k)
+    # identify seed tracks with enough length to fit initial ellipse
+    candidates = []
+    for i, tr in enumerate(seed_tracks):
+        valid_mask = ~np.isnan(tr).any(axis=1)
+        valid_pts = tr[valid_mask]
+        if valid_pts.shape[0] >= ELLIPSE_INIT_MIN_FRAMES:
+            e = fit_ellipse_to_points(valid_pts)
+            if e is not None:
+                traj = [(t, float(tr[t,0]), float(tr[t,1])) for t in range(T) if not np.isnan(tr[t]).any()]
+                cand = {
+                    'seed_idx': i,
+                    'initial_ellipse': e,
+                    'trajectory': traj,
+                    'assigned_frames': set([int(t) for (t,_,_) in traj])
+                }
+                candidates.append(cand)
 
+    # build det_assigned bookkeeping
+    det_assigned = []
+    for t in range(T):
+        det_assigned.append(np.full((pts_frames[t].shape[0] if pts_frames[t].shape[0]>0 else 0,), -1, dtype=np.int32))
 
-    # 3. Aggregate individual trajectories into Super-Trajectories
-    unique_labels = np.unique(labels)
-    super_trajectories = []
-    print(f"Clustered {len(valid_traj_indices)} tracks into {len(unique_labels)} groups.")
+    # link seed tracks to nearest frame detections (small tolerance)
+    for ei, cand in enumerate(candidates):
+        seed_i = cand['seed_idx']
+        tr = seed_tracks[seed_i]
+        for t in range(T):
+            if not np.isnan(tr[t]).any():
+                pts = pts_frames[t]
+                if pts.shape[0] == 0: continue
+                d = np.linalg.norm(pts - tr[t].reshape(1,2), axis=1)
+                j = int(d.argmin())
+                if d[j] < 3.0:
+                    det_assigned[t][j] = ei
+                    cand['assigned_frames'].add(t)
 
-    for label in unique_labels:
-        if label == -1: continue # Ignore noise
-        
-        cluster_indices = [valid_traj_indices[i] for i, l in enumerate(labels) if l == label]
-        
-        # Merge trajectory points (t, x, y) from all tracks in the cluster
-        merged_trajectory = []
-        for traj_idx in cluster_indices:
-            merged_trajectory.extend(trajectories[traj_idx]['trajectory'])
+    # extend each candidate by sampling ellipse perimeter and searching for unassigned detections near perimeter
+    for ei, cand in enumerate(candidates):
+        e = cand['initial_ellipse']
+        samples = ellipse_samples_from_params(e, n=ELLIPSE_SAMPLE_RES)
+        traj_map = {t:(x,y) for (t,x,y) in cand['trajectory']}
+        for t in range(T):
+            if t in traj_map: continue
+            pts = pts_frames[t]
+            if pts.shape[0] == 0: continue
+            dists = np.array([distance_point_to_samples(pts[j], samples) if det_assigned[t][j] < 0 else np.inf for j in range(pts.shape[0])])
+            jmin = int(dists.argmin())
+            dmin = float(dists[jmin])
+            if dmin <= ELLIPSE_MATCH_DIST_PX:
+                det_assigned[t][jmin] = ei
+                traj_map[t] = (float(pts[jmin,0]), float(pts[jmin,1]))
+        full_traj = sorted([(t,)+traj_map[t] for t in traj_map])
+        cand['trajectory'] = [(int(t), float(x), float(y)) for (t,x,y) in full_traj]
+        pts_all = np.array([[x,y] for (t,x,y) in cand['trajectory']], np.float32)
+        if pts_all.shape[0] >= 5:
+            e_refit = fit_ellipse_to_points(pts_all)
+            if e_refit is not None:
+                cand['fitted_ellipse'] = e_refit
+                cand['ellipse_samples'] = ellipse_samples_from_params(e_refit, n=ELLIPSE_SAMPLE_RES)
+            else:
+                cand['fitted_ellipse'] = e
+                cand['ellipse_samples'] = samples
+        else:
+            cand['fitted_ellipse'] = e
+            cand['ellipse_samples'] = samples
 
-        # Create a dictionary to map time index to a list of (x,y) points
-        traj_map = {}
-        for (t,x,y) in merged_trajectory:
-            if t not in traj_map:
-                traj_map[t] = []
-            traj_map[t].append((x,y))
-
-        # Build the final Super-Trajectory object
-        # The 'trajectory' now holds ALL points from the cluster for 3D estimation
-        super_traj = {
-            'label': int(label),
-            'cluster_indices': cluster_indices,
-            'trajectory_map': traj_map, # For easier visualization access
-            'trajectory': merged_trajectory # List of (t, x, y) tuples
-        }
-        
-        # If possible, include a reference frame index for single-frame visualization
-        if traj_map:
-             super_traj['ref_frame_idx'] = sorted(traj_map.keys())[len(traj_map)//2]
-        
-        super_trajectories.append(super_traj)
-        
-    return super_trajectories
+    # filter short trajectories and return
+    trajectories = []
+    for cand in candidates:
+        if len(cand['trajectory']) >= MIN_TRAJECTORY_LEN:
+            trajectories.append({
+                'trajectory': cand['trajectory'],
+                'fitted_ellipse': cand.get('fitted_ellipse', None),
+                'ellipse_samples': cand.get('ellipse_samples', None)
+            })
+    return trajectories
 
 def refine_ellipses_with_depth(trajectories, poses, K):
     """
-    For each Super-Trajectory:
-      - triangulate 3D points from tracked 2D observations (now many points per frame)
+    For each trajectory:
+      - triangulate 3D points from many frame pairs using tracked 2D observations
       - fit 3D circle in best-fit plane
-      - sample 3D circle and project into a reference image
+      - sample 3D circle and project into a reference image (e.g., middle frame)
       - fit an ellipse to that projection -> refined ellipse (depth-aware)
     Returns updated trajectories with 'refined_ellipse' and 'circle3d' fields (if successful)
     """
     T = len(poses)
     refined_count = 0
-    
     for tr in trajectories:
-        traj = tr['trajectory']  # list of (t,x,y) from all clustered tracks
-        
-        # Check if enough distinct observations exist (min frames and min total points)
-        if len(set([t for (t,_,_) in traj])) < 2 or len(traj) < 10:
-            tr['refined_ellipse'] = None
+        traj = tr['trajectory']  # list of (t,x,y)
+        if len(traj) < 2:
+            tr['refined_ellipse'] = tr.get('fitted_ellipse', None)
             tr['circle3d'] = None
             continue
-            
-        # 1. Triangulate many pairs
-        # The original triangulate_trajectory_points function is designed for a single track point,
-        # but since 'traj' contains all the points, it will naturally triangulate all pairs, 
-        # which is what we want for a robust fit.
-        X3 = triangulate_trajectory_points(traj, poses, K, min_pairs=10) # Require more pairs for a dense point cloud
-        
-        if X3.shape[0] < 10: # Require a dense enough 3D cloud
-            tr['refined_ellipse'] = None
+        # triangulate many pairs
+        X3 = triangulate_trajectory_points(traj, poses, K, min_pairs=1)
+        if X3.shape[0] < 3:
+            tr['refined_ellipse'] = tr.get('fitted_ellipse', None)
             tr['circle3d'] = None
             continue
-            
-        # 2. Fit 3D circle
         circle3d = build_3d_circle_from_triangulated(X3)
         if circle3d is None:
-            tr['refined_ellipse'] = None
+            tr['refined_ellipse'] = tr.get('fitted_ellipse', None)
             tr['circle3d'] = None
             continue
-            
-        # 3. Sample 3D circle and reproject to a reference frame
+        # sample 3D circle and reproject to a reference frame (choose middle frame)
         sample3d = sample_3d_circle(circle3d, n=256)  # (N,3)
-        ref_t = tr.get('ref_frame_idx', sorted([t for (t,_,_) in traj])[len(traj)//2]) # Use the stored ref frame if available
-        
+        # pick a reference frame where trajectory has observation (middle if possible)
+        ref_t = sorted([t for (t,_,_) in traj])[len(traj)//2]
         ct_ref, Rc_ref = poses[ref_t]
         P_ref = compute_camera_projection(K, Rc_ref, ct_ref)
-        
-        # Project sample3d into image
+        # project sample3d into image
         X4 = np.vstack([sample3d.T, np.ones((1, sample3d.shape[0]))])
         proj = (P_ref @ X4)
         proj_xy = (proj[:2] / (proj[2:3] + 1e-9)).T  # (N,2)
-        
-        # 4. Fit ellipse to the projected samples
+        # fit ellipse to the projected samples
         e_proj = fit_ellipse_to_points(proj_xy.astype(np.float32))
-        
         if e_proj is not None:
             tr['refined_ellipse'] = e_proj
             tr['circle3d'] = circle3d
             refined_count += 1
         else:
-            tr['refined_ellipse'] = None
+            tr['refined_ellipse'] = tr.get('fitted_ellipse', None)
             tr['circle3d'] = None
-            
     return refined_count
 
 def ellipse_descriptor_from_params(e):
@@ -780,73 +693,59 @@ def main():
 
     # ellipse propagation (seed + extension)
     print("Ellipse propagation (seed + extension)...")
-    individual_trajectories = ellipse_propagation_pipeline(frames_bgr, pts_frames, contours_frames, poses, K)
-    print(f"Trajectories seeded and extended: {len(individual_trajectories)}")
-    
-    # ---------------- Trajectory Grouping (The Fix) ----------------
-    print("Grouping individual trajectories into Super-Trajectories...")
-    super_trajectories = group_trajectories_by_initial_fit(individual_trajectories, BASE_W, BASE_H)
-    print(f"Grouped into {len(super_trajectories)} Super-Trajectories.")
-    
-    # Visualize the (many) individual trajectories colored by their future cluster ID
-    n_traj = max(1, len(individual_trajectories))
+    trajectories = ellipse_propagation_pipeline(frames_bgr, pts_frames, contours_frames, poses, K)
+    print(f"Trajectories seeded and extended: {len(trajectories)}")
+
+    # visualize per-trajectory assignments
+    n_traj = max(1, len(trajectories))
     colors = color_list(max(16, n_traj))
-    
-    # Map the individual trajectories to their new Super-Trajectory label for visualization
-    traj_label_map = {}
-    for st in super_trajectories:
-        for i in st['cluster_indices']:
-            traj_label_map[i] = st['label']
-            
     assigned_vid = []
     for t in range(len(frames_bgr)):
         img = frames_bgr[t].copy()
-        for i, tr in enumerate(individual_trajectories):
-            label = traj_label_map.get(i, -1)
-            # Use the label index for coloring, or a generic color for noise (-1)
-            col_idx = label % len(colors) if label != -1 else len(colors)-1
-            col = tuple(int(c) for c in colors[col_idx])
-            
+        if pts_frames[t].shape[0] > 0:
+            for j,p in enumerate(pts_frames[t].astype(np.int32)):
+                cv2.circle(img, tuple(p), 2, (80,80,80), -1)
+        for i,tr in enumerate(trajectories):
             for (ft,x,y) in tr['trajectory']:
                 if ft == t:
-                    cv2.circle(img, (int(round(x)), int(round(y))), 3, col, -1)
+                    cv2.circle(img, (int(round(x)), int(round(y))), 3, tuple(int(c) for c in colors[i%len(colors)]), -1)
                     break
-        cv2.putText(img, f"Frame {t+1}/{len(frames_bgr)} (Points colored by Group ID)", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255),2)
+        cv2.putText(img, f"Frame {t+1}/{len(frames_bgr)}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255),2)
         assigned_vid.append(img)
-    write_video(os.path.join(debug_dir, "02_tracked_points_by_group_ID.mp4"), assigned_vid, fps=30)
-    
-    # debug overlay of groups
+    write_video(os.path.join(debug_dir, "02_tracked_points_by_ellipse.mp4"), assigned_vid, fps=30)
+
+    # debug overlay
     mid = len(frames_bgr)//2
-    overlay = draw_trajectories_overlay(frames_bgr[mid], super_trajectories, colors, draw_points=True, draw_ellipses=False)
+    overlay = draw_trajectories_overlay(frames_bgr[mid], trajectories, colors, draw_points=True, draw_ellipses=False)
     cv2.imwrite(os.path.join(debug_dir, "03_trajectories_overlay.png"), overlay)
 
-    # ---------------- depth-aware refinement (on Super-Trajectories) ----------------
-    print("Refining ellipses using triangulation/parallax on Super-Trajectories...")
-    refined_count = refine_ellipses_with_depth(super_trajectories, poses, K)
-    print(f"Refined {refined_count} Super-Trajectories with 3D circle fit")
+    # ---------------- depth-aware refinement ----------------
+    print("Refining ellipses using triangulation/parallax...")
+    refined_count = refine_ellipses_with_depth(trajectories, poses, K)
+    print(f"Refined {refined_count} trajectories with 3D circle fit")
 
     # draw overlay with refined ellipses
-    overlay_refined = draw_trajectories_overlay(frames_bgr[mid], super_trajectories, colors, draw_points=True, draw_ellipses=True)
+    overlay_refined = draw_trajectories_overlay(frames_bgr[mid], trajectories, colors, draw_points=True, draw_ellipses=True)
     cv2.imwrite(os.path.join(debug_dir, "04_refined_ellipses_overlay.png"), overlay_refined)
 
-    # build descriptors [cx,cy,w,h]
+    # build descriptors [cx,cy,w,h] using refined ellipse when available else fitted
     descriptors_full = []
     traj_indices_full = []
-    for i,tr in enumerate(super_trajectories):
-        e = tr.get('refined_ellipse')
+    for i,tr in enumerate(trajectories):
+        e = tr.get('refined_ellipse') or tr.get('fitted_ellipse')
         if e is None:
             continue
         desc = ellipse_descriptor_from_params(e)
         descriptors_full.append(desc)
-        traj_indices_full.append(i) # This is the index of the Super-Trajectory
+        traj_indices_full.append(i)
         
     if len(descriptors_full) == 0:
-        print("No descriptors available after grouping and refinement, exiting.")
+        print("No descriptors available, exiting.")
         return
         
     descs_full = np.vstack(descriptors_full)
 
-    # Filter abnormal descriptors (should be less needed now, but kept for safety)
+    # Filter abnormal descriptors based on image size limits
     descs, traj_indices = filter_abnormal_descriptors(descs_full, traj_indices_full, BASE_W, BASE_H)
 
     if descs.shape[0] == 0:
@@ -855,19 +754,16 @@ def main():
         
     descs_norm = normalize_descriptors(descs, W=BASE_W, H=BASE_H)
 
-    # DBSCAN clustering (on normalized descriptors) - now for the final, clean set of rings
+    # DBSCAN clustering (on normalized descriptors)
     eps_norm = DBSCAN_EPS / float((BASE_W + BASE_H) / 2.0)
     if SKLEARN_OK:
-        # DBSCAN is now run on a small, clean set of points (approx 4)
         db = DBSCAN(eps=eps_norm, min_samples=DBSCAN_MIN_SAMPLES, metric='euclidean')
         labels = db.fit_predict(descs_norm)
     else:
-        # fallback: simple kmeans (using N_RINGS=4)
-        def kmeans_simple(X, k=N_RINGS):
+        # fallback: simple kmeans
+        def kmeans_simple(X, k=1):
             rng = np.random.default_rng(42)
             N = X.shape[0]
-            k = min(k, N)
-            if k == 0: return np.zeros(N, dtype=np.int64) - 1
             centers = X[rng.choice(N, size=k, replace=False)]
             for _ in range(50):
                 d = np.linalg.norm(X[:,None,:] - centers[None,:,:], axis=2)
@@ -877,61 +773,43 @@ def main():
                 centers = newc
             d = np.linalg.norm(X[:,None,:] - centers[None,:,:], axis=2)
             return d.argmin(axis=1)
-            
-        labels = kmeans_simple(descs_norm, N_RINGS)
+        k = min(max(1, N_RINGS), descs_norm.shape[0])
+        labels = kmeans_simple(descs_norm, k)
 
     unique, counts = np.unique(labels, return_counts=True)
-    print("Final Clustering result counts (Super-Trajectories):", dict(zip(unique, counts)))
+    print("Clustering result counts:", dict(zip(unique, counts)))
 
     # save descriptors CSV
     with open(os.path.join(debug_dir, "ellipse_descriptors_labels.csv"), 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(["super_traj_index","cx","cy","w","h","label"])
+        w.writerow(["traj_index","cx","cy","w","h","label"])
         for idx, ti in enumerate(traj_indices):
             cx,cy,wid,hei = descs[idx]
             lab = int(labels[idx])
             w.writerow([int(ti), float(cx), float(cy), float(wid), float(hei), lab])
 
-    # visualization: color all original points by their final cluster label
+    # visualization: color trajectories by cluster label
     label_colors = color_list(max(8, len(unique)))
     clustering_vid = []
+    # Need to map the filtered traj_indices back to the original list of trajectories for visualization
+    traj_map_filtered = {traj_indices[i]: descs[i] for i in range(len(traj_indices))}
     
-    # Create a final map: Original Trajectory Index -> Final Cluster Label
-    final_label_map = {}
-    for st_idx, final_label in zip(traj_indices, labels):
-        st = super_trajectories[st_idx]
-        for original_idx in st['cluster_indices']:
-            final_label_map[original_idx] = final_label
-            
-    # Now draw the individual points colored by the final cluster label
     for t in range(len(frames_bgr)):
         img = frames_bgr[t].copy()
-        
-        # Draw points for all original tracks
-        for i, tr in enumerate(individual_trajectories):
-            final_lab = final_label_map.get(i, -1) # -1 for noise/unrefined groups
-            if final_lab == -1: continue # Don't draw points from unrefined groups
+        for idx, traj_idx in enumerate(traj_indices):
+            lab = int(labels[idx])
+            col = tuple(int(c) for c in label_colors[lab % len(label_colors)])
             
-            col = tuple(int(c) for c in label_colors[final_lab % len(label_colors)])
-            
-            for (ft,x,y) in tr['trajectory']:
-                if ft == t:
-                    cv2.circle(img, (int(round(x)), int(round(y))), 3, col, -1)
-                    break
-                    
-        # Also draw the refined ellipse on top
-        for idx, st in enumerate(super_trajectories):
-            if st.get('refined_ellipse') is not None and idx in traj_indices:
-                final_lab = labels[traj_indices.index(idx)]
-                col = tuple(int(c) for c in label_colors[final_lab % len(label_colors)])
-                e = st['refined_ellipse']
-                cv2.ellipse(img, ( (int(round(e[0][0])), int(round(e[0][1]))),
-                                   (int(round(e[1][0])), int(round(e[1][1]))),
-                                   float(e[2]) ), color=col, thickness=2, lineType=cv2.LINE_AA)
-
-        cv2.putText(img, f"Frame {t+1}/{len(frames_bgr)} (Points colored by Final Cluster)", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+            # Find the original trajectory object using the index
+            if traj_idx < len(trajectories):
+                tr = trajectories[traj_idx]
+                for (ft,x,y) in tr['trajectory']:
+                    if ft == t:
+                        cv2.circle(img, (int(round(x)), int(round(y))), 3, col, -1)
+                        break
+                        
+        cv2.putText(img, f"Frame {t+1}/{len(frames_bgr)}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
         clustering_vid.append(img)
-        
     write_video(os.path.join(run_dir, "clustering_by_ellipse_descriptor.mp4"), clustering_vid, fps=30)
 
     # diagnostic scatter of centers colored by cluster
@@ -939,7 +817,7 @@ def main():
     for lab in np.unique(labels):
         mask = (labels == lab)
         plt.scatter(descs[mask,0], descs[mask,1], label=f"lab {lab}", alpha=0.8)
-    plt.xlabel("cx (px)"); plt.ylabel("cy (px)"); plt.title("Ellipse centers colored by cluster (Filtered Super-Trajectories)")
+    plt.xlabel("cx (px)"); plt.ylabel("cy (px)"); plt.title("Ellipse centers colored by cluster (Filtered)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(debug_dir, "05_descriptor_centers_by_cluster_refined.png"), dpi=150)
