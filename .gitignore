@@ -1,0 +1,7 @@
+# Ignore all automatically generated visualization and data output directories
+# This ignores all contents inside these folders, including all the run_* subdirectories
+# and the PNG/MP4/CSV files they contain.
+
+**/algorithmOutputVisualizations/
+**/debugInfo/
+**/meshOutputs/
